@@ -419,7 +419,7 @@ async def _create_comment_impl(
     author = comment.get("author", {}).get("displayName", "Unknown")
     created = comment.get("createdTime", "")
 
-    return f"Comment created successfully!\nComment ID: {comment_id}\nAuthor: {author}\nCreated: {created}\n{_format_field('Content: ', comment_content)}"
+    return f\nComment ID: {comment_id}\nAuthor: {author}\nCreated: {created}\n{_format_field('Content: ', comment_content)}"
 
 
 async def _create_cell_comment_impl(
