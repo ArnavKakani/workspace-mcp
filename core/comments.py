@@ -7,6 +7,7 @@ All Google Workspace apps (Docs, Sheets, Slides) use the Drive API for comment o
 
 import logging
 import asyncio
+import json
 import os
 from typing import Awaitable, Callable, Optional
 
@@ -44,8 +45,11 @@ async def _manage_comment_dispatch(
     cell: Optional[str] = None,
     sheets_service=None,
     insert_cell_comment: Optional[Callable[..., Awaitable[str]]] = None,
+    anchor_text: Optional[str] = None,
 ) -> str:
     """Route comment management actions to the appropriate implementation."""
+    if anchor_text and action.lower().strip() != "create":
+        raise ValueError("anchor_text is only supported for the create action")
     action_lower = action.lower().strip()
     if cell and action_lower in ("reply", "resolve"):
         raise ValueError("cell is only supported for the create action")
@@ -58,7 +62,9 @@ async def _manage_comment_dispatch(
             return await _create_cell_comment_impl(
                 insert_cell_comment, sheets_service, file_id, cell, comment_content
             )
-        return await _create_comment_impl(service, app_name, file_id, comment_content)
+        return await _create_comment_impl(
+            service, app_name, file_id, comment_content, anchor_text=anchor_text
+        )
     elif action_lower == "reply":
         if not comment_id or not comment_content:
             raise ValueError(
@@ -124,18 +130,27 @@ def create_comment_tools(
             action: str,
             comment_content: Optional[str] = None,
             comment_id: Optional[str] = None,
+            anchor_text: Optional[str] = None,
         ) -> str:
             """Manage comments on a Google Document.
 
             Actions:
-              - create: Create a new document-level comment. Requires comment_content.
-                Note: The Drive API cannot anchor comments to specific text; only
-                the Google Docs UI can do that.
+              - create: Create a comment. Requires comment_content. Pass anchor_text
+                (an exact, unique passage from the document) to attach the comment
+                to that passage: it is quoted on the comment card and verified to
+                exist exactly once. Google Docs does not highlight API-created
+                anchors in the margin, so the quote is the visible link.
               - reply: Reply to a comment. Requires comment_id and comment_content.
               - resolve: Resolve a comment. Requires comment_id.
             """
             return await _manage_comment_dispatch(
-                service, app_name, document_id, action, comment_content, comment_id
+                service,
+                app_name,
+                document_id,
+                action,
+                comment_content,
+                comment_id,
+                anchor_text=anchor_text,
             )
 
     elif file_id_param == "spreadsheet_id":
@@ -350,24 +365,52 @@ async def _read_comments_impl(
 
 
 async def _create_comment_impl(
-    service, app_name: str, file_id: str, comment_content: str
+    service,
+    app_name: str,
+    file_id: str,
+    comment_content: str,
+    anchor_text: Optional[str] = None,
 ) -> str:
     """Implementation for creating a comment on any Google Workspace file.
 
-    Note: Comments created via the Drive API appear as document-level comments.
-    The Google Drive API does not support anchoring comments to specific text in
-    Google Docs; only the Docs UI can create anchored comments.
+    With anchor_text, the comment quotes that exact passage (Drive
+    ``quotedFileContent``) after verifying it occurs exactly once in the file,
+    and sets a best-effort Drive ``anchor`` region. Google Docs renders Drive
+    API anchors as unanchored, so the quote is what makes the target visible;
+    the offset anchor is kept for file types that honour it.
     """
     logger.info(f"[create_{app_name}_comment] Creating comment in {app_name} {file_id}")
 
     body = {"content": comment_content}
+    quoted_note = ""
+    if anchor_text:
+        text = await asyncio.to_thread(
+            service.files().export(fileId=file_id, mimeType="text/plain").execute
+        )
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", errors="replace")
+        count = text.count(anchor_text)
+        if count == 0:
+            raise ValueError(
+                f"anchor_text was not found in the {app_name}. Pass the passage exactly as it appears."
+            )
+        if count > 1:
+            raise ValueError(
+                f"anchor_text matches {count} places in the {app_name}; use a longer, unique passage."
+            )
+        offset = text.index(anchor_text)
+        body["quotedFileContent"] = {"mimeType": "text/plain", "value": anchor_text}
+        body["anchor"] = json.dumps(
+            {"r": "head", "a": [{"txt": {"o": offset, "l": len(anchor_text)}}]}
+        )
+        quoted_note = f' quoting "{anchor_text[:60]}{"…" if len(anchor_text) > 60 else ""}"'
 
     comment = await asyncio.to_thread(
         service.comments()
         .create(
             fileId=file_id,
             body=body,
-            fields="id,content,author,createdTime,modifiedTime",
+            fields="id,content,author,createdTime,modifiedTime,quotedFileContent",
         )
         .execute
     )
