@@ -375,9 +375,8 @@ async def _create_comment_impl(
 
     With anchor_text, the comment quotes that exact passage (Drive
     ``quotedFileContent``) after verifying it occurs exactly once in the file,
-    and sets a best-effort Drive ``anchor`` region. Google Docs renders Drive
-    API anchors as unanchored, so the quote is what makes the target visible;
-    the offset anchor is kept for file types that honour it.
+    No Drive ``anchor`` region is set: Google Docs cannot resolve API-defined
+    regions and shows such comments as "Original content deleted".
     """
     logger.info(f"[create_{app_name}_comment] Creating comment in {app_name} {file_id}")
 
@@ -398,11 +397,10 @@ async def _create_comment_impl(
             raise ValueError(
                 f"anchor_text matches {count} places in the {app_name}; use a longer, unique passage."
             )
-        offset = text.index(anchor_text)
+        # No Drive ``anchor`` region: Google Docs cannot resolve API-defined
+        # regions and labels such comments "Original content deleted". The
+        # verified quote alone is what ties the comment to the passage.
         body["quotedFileContent"] = {"mimeType": "text/plain", "value": anchor_text}
-        body["anchor"] = json.dumps(
-            {"r": "head", "a": [{"txt": {"o": offset, "l": len(anchor_text)}}]}
-        )
         quoted_note = f' quoting "{anchor_text[:60]}{"…" if len(anchor_text) > 60 else ""}"'
 
     comment = await asyncio.to_thread(
