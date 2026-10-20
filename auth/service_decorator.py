@@ -141,6 +141,40 @@ async def _get_auth_context(
         return None, None, None
 
 
+def _account_pool() -> set:
+    """Accounts one owner may switch between under a single OAuth 2.1 connection.
+
+    WORKSPACE_MCP_ACCOUNT_POOL: comma-separated emails. Every pooled account must
+    sign in once (any client); the server persists its Google credentials and any
+    pooled caller may then name it via user_google_email. Empty = stock behaviour.
+    """
+    raw = os.getenv("WORKSPACE_MCP_ACCOUNT_POOL", "")
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+
+def _resolve_pooled_account(authenticated_user, kwargs, tool_name):
+    """Account to act as: a pooled account named in kwargs, else the authenticated
+    user. Raises on a name outside the pool, or a caller outside the pool."""
+    requested = kwargs.get("user_google_email")
+    pool = _account_pool()
+    if not requested or not pool:
+        return authenticated_user
+    auth_l = (authenticated_user or "").lower()
+    req_l = requested.lower()
+    if req_l == auth_l:
+        return authenticated_user
+    if auth_l not in pool:
+        raise GoogleAuthenticationError(
+            f"{authenticated_user} is not in the account pool; cannot act as {requested}."
+        )
+    if req_l not in pool:
+        raise GoogleAuthenticationError(
+            f"{requested} is not a pooled account. Pool: {sorted(pool)}"
+        )
+    logger.info(f"[{tool_name}] account pool: {authenticated_user} acting as {requested}")
+    return requested
+
+
 def _user_email_is_managed() -> bool:
     """True when the server determines user_google_email from a verified identity
     (an OAuth 2.1 access token OR a trusted-gateway assertion) instead of the caller
@@ -437,6 +471,28 @@ async def get_authenticated_google_service_oauth21(
             raise GoogleAuthenticationError(
                 "Access token email does not match authenticated session context."
             )
+
+        pool = _account_pool()
+        if (
+            token_email and user_google_email and token_email != user_google_email
+            and token_email.lower() in pool and user_google_email.lower() in pool
+        ):
+            # Pooled switch: act as another of the owner's accounts.
+            credentials = get_oauth21_session_store().get_credentials(user_google_email)
+            if not credentials:
+                raise GoogleAuthenticationError(
+                    f"No stored Google credentials for pooled account {user_google_email}. "
+                    "Sign in as that account once (any connector) so the server can persist it."
+                )
+            if not has_required_scopes(set(credentials.scopes or []), required_scopes):
+                raise GoogleScopeError(
+                    f"Pooled account {user_google_email} lacks required scopes: {required_scopes}"
+                )
+            service = build_google_service(service_name, version, credentials)
+            logger.info(
+                f"[{tool_name}] Authenticated {service_name} for {user_google_email} via account pool"
+            )
+            return service, user_google_email
 
         if token_email and user_google_email and token_email != user_google_email:
             raise GoogleAuthenticationError(
@@ -804,8 +860,20 @@ def require_google_service(
         # Create a new signature for the wrapper that excludes the 'service' parameter.
         # In OAuth 2.1 mode, also exclude 'user_google_email' since it's automatically determined.
         if _user_email_is_managed():
-            # Remove both 'service' and 'user_google_email' parameters
-            filtered_params = [p for p in params[1:] if p.name != "user_google_email"]
+            if _account_pool():
+                # Pool mode: keep user_google_email as an OPTIONAL account selector.
+                filtered_params = [
+                    p.replace(default=None, annotation=Optional[str])
+                    if p.name == "user_google_email" else p
+                    for p in params[1:]
+                ]
+                # params with defaults must follow those without
+                filtered_params.sort(
+                    key=lambda p: p.default is not inspect.Parameter.empty
+                )
+            else:
+                # Remove both 'service' and 'user_google_email' parameters
+                filtered_params = [p for p in params[1:] if p.name != "user_google_email"]
             wrapper_sig = original_sig.replace(parameters=filtered_params)
         else:
             # Only remove 'service' parameter for OAuth 2.0 mode.
@@ -829,6 +897,9 @@ def require_google_service(
                     authenticated_user,
                     auth_method,
                     func.__name__,
+                )
+                user_google_email = _resolve_pooled_account(
+                    user_google_email, kwargs, func.__name__
                 )
             else:
                 user_google_email = _extract_oauth20_user_email(

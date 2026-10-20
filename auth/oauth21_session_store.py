@@ -673,6 +673,7 @@ class OAuth21SessionStore:
             }
 
             self._sessions[user_email] = session_info
+            self._persist_google_credentials(user_email, session_info)
 
             # Store MCP session mapping if provided
             if mcp_session_id:
@@ -706,6 +707,27 @@ class OAuth21SessionStore:
             if session_id and session_id not in self._session_auth_binding:
                 self._session_auth_binding[session_id] = user_email
 
+    def _persist_google_credentials(self, user_email: str, session_info: Dict[str, Any]) -> None:
+        """Keep a pooled account's Google credentials on disk so it survives restarts
+        even when no client is connected as it. Never lets persistence break a login."""
+        if not session_info.get("refresh_token"):
+            return
+        try:
+            from auth.credential_store import get_credential_store
+
+            creds = Credentials(
+                token=session_info["access_token"],
+                refresh_token=session_info.get("refresh_token"),
+                token_uri=session_info["token_uri"],
+                client_id=session_info.get("client_id"),
+                client_secret=session_info.get("client_secret"),
+                scopes=session_info.get("scopes", []),
+                expiry=session_info.get("expiry"),
+            )
+            get_credential_store().store_credential(user_email, creds)
+        except Exception as e:
+            logger.warning(f"Could not persist credentials for {user_email}: {e}")
+
     def get_credentials(self, user_email: str) -> Optional[Credentials]:
         """
         Get Google credentials for a user from OAuth 2.1 session.
@@ -719,6 +741,17 @@ class OAuth21SessionStore:
         with self._lock:
             session_info = self._sessions.get(user_email)
             if not session_info:
+                # Fallback: persisted credentials (pooled account, no live session)
+                try:
+                    from auth.credential_store import get_credential_store
+
+                    stored = get_credential_store().get_credential(user_email)
+                except Exception as e:
+                    logger.debug(f"credential store lookup failed for {user_email}: {e}")
+                    stored = None
+                if stored:
+                    logger.debug(f"Loaded persisted credentials for {user_email}")
+                    return stored
                 logger.debug(f"No OAuth 2.1 session found for {user_email}")
                 return None
 
